@@ -33,10 +33,24 @@
           "resizeMode": "contain",
           "backgroundColor": "#ffffff"
         }
+      ],
+      "expo-av",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow EchoPlay to access your photos",
+          "videoPermission": "Allow EchoPlay to access your videos",
+          "savePhotosPermission": "Allow EchoPlay to save photos",
+          "saveVideosPermission": "Allow EchoPlay to save videos"
+        }
       ]
     ],
     "experiments": {
       "typedRoutes": true
-    }
+    },
+    "permissions": [
+      "READ_EXTERNAL_STORAGE",
+      "WRITE_EXTERNAL_STORAGE"
+    ]
   }
 }

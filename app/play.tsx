@@ -1,0 +1,552 @@
+import { FontAwesome, MaterialIcons } from '@expo/vector-icons';
+import NetInfo from '@react-native-community/netinfo';
+import { Audio } from 'expo-av';
+import { LinearGradient } from 'expo-linear-gradient';
+import * as MediaLibrary from 'expo-media-library';
+import { useRouter } from 'expo-router';
+import { useEffect, useState } from 'react';
+import {
+  ActivityIndicator,
+  Alert,
+  FlatList,
+  Image,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from 'react-native';
+
+export default function PlayScreen() {
+  const router = useRouter();
+  const [tracks, setTracks] = useState([]);
+  const [localTracks, setLocalTracks] = useState([]);
+  const [filteredTracks, setFilteredTracks] = useState([]);
+  const [isConnected, setIsConnected] = useState(true);
+  const [activeSegment, setActiveSegment] = useState('all');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [favorites, setFavorites] = useState({});
+  const [currentTrack, setCurrentTrack] = useState(null);
+  const [sound, setSound] = useState(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [hasPermission, setHasPermission] = useState(null);
+
+  const JAMENDO_CLIENT_ID = 'a74cceda';
+  const JAMENDO_API_URL = `https://api.jamendo.com/v3.0/tracks/?client_id=${JAMENDO_CLIENT_ID}&format=json&limit=10`;
+  const PLACEHOLDER_IMAGE = require('../assets/images/placeholder.jpg');
+
+  // Request media library permissions
+  useEffect(() => {
+    (async () => {
+      const { status } = await MediaLibrary.requestPermissionsAsync();
+      setHasPermission(status === 'granted');
+      if (status !== 'granted') {
+        Alert.alert('Permission Denied', 'Please grant media library access to view local tracks.');
+      }
+    })();
+  }, []);
+
+  // Fetch online tracks from Jamendo
+  const fetchTracks = async (isRetry = false) => {
+    if (!isConnected) return;
+    setIsLoading(true);
+    try {
+      const response = await fetch(JAMENDO_API_URL);
+      if (!response.ok) {
+        throw new Error('Network response was not ok');
+      }
+      const data = await response.json();
+      const validTracks = data.results
+        .filter(track => track.audio && isValidUrl(track.audio))
+        .map(track => ({
+          ...track,
+          audio: { uri: track.audio },
+        }));
+      setTracks(validTracks);
+      setFilteredTracks(validTracks);
+      if (validTracks.length === 0 && data.results.length > 0) {
+        Alert.alert('Warning', 'No tracks with valid audio URLs found');
+      }
+    } catch (error) {
+      console.error('Error fetching tracks:', error);
+      if (!isRetry) {
+        Alert.alert('Error', 'Failed to load online tracks. Retry?', [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Retry', onPress: () => fetchTracks(true) },
+        ]);
+      } else {
+        Alert.alert('Error', 'Failed to load online tracks');
+      }
+    } finally {
+      setIsLoading(false);
+      setIsRefreshing(false);
+    }
+  };
+
+  // Validate URL
+  const isValidUrl = (url) => {
+    try {
+      new URL(url);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // Fetch local tracks from device
+  const fetchLocalTracks = async () => {
+    if (!hasPermission) {
+      setLocalTracks([]);
+      setFilteredTracks([]);
+      return;
+    }
+    try {
+      const { assets } = await MediaLibrary.getAssetsAsync({
+        mediaType: ['audio'],
+        first: 50,
+      });
+      const localTracks = assets.map(asset => ({
+        id: asset.id,
+        name: asset.filename || 'Unknown Track',
+        artist_name: asset.filename.split('-')[0]?.trim() || 'Unknown Artist',
+        duration: asset.duration || 0,
+        audio: { uri: asset.uri },
+        image: asset.uri ? { uri: asset.uri } : PLACEHOLDER_IMAGE,
+      }));
+      setLocalTracks(localTracks);
+      setFilteredTracks(localTracks);
+    } catch (error) {
+      console.error('Error fetching local tracks:', error);
+      Alert.alert('Error', 'Failed to load local tracks');
+    }
+  };
+
+  // Handle pull-to-refresh
+  const onRefresh = () => {
+    setIsRefreshing(true);
+    if (activeSegment === 'all') {
+      fetchTracks();
+    } else {
+      fetchLocalTracks();
+      setIsRefreshing(false);
+    }
+  };
+
+  // Initial data fetch
+  useEffect(() => {
+    fetchTracks();
+    fetchLocalTracks();
+  }, [isConnected, hasPermission]);
+
+  // Network monitoring
+  useEffect(() => {
+    const unsubscribe = NetInfo.addEventListener(state => {
+      setIsConnected(state.isConnected ?? true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Filter tracks based on search query
+  useEffect(() => {
+    const data = activeSegment === 'all' ? tracks : localTracks;
+    if (searchQuery.trim() === '') {
+      setFilteredTracks(data);
+    } else {
+      const query = searchQuery.toLowerCase();
+      const filtered = data.filter(
+        track =>
+          track.name.toLowerCase().includes(query) ||
+          track.artist_name.toLowerCase().includes(query)
+      );
+      setFilteredTracks(filtered);
+    }
+  }, [searchQuery, tracks, localTracks, activeSegment]);
+
+  // Toggle favorite status
+  const toggleFavorite = (trackId) => {
+    setFavorites(prev => ({
+      ...prev,
+      [trackId]: !prev[trackId],
+    }));
+  };
+
+  // Play or stop track
+  const playTrack = async (track) => {
+    if (!track.audio) {
+      Alert.alert('Error', 'Invalid audio source');
+      return;
+    }
+
+    if (currentTrack?.id === track.id && isPlaying) {
+      if (sound) {
+        await sound.stopAsync();
+        await sound.unloadAsync();
+        setSound(null);
+        setIsPlaying(false);
+        setCurrentTrack(null);
+      }
+      return;
+    }
+
+    if (sound) {
+      await sound.stopAsync();
+      await sound.unloadAsync();
+    }
+    const newSound = new Audio.Sound();
+    try {
+      const audioSource = typeof track.audio === 'string' ? { uri: track.audio } : track.audio;
+      if (!audioSource.uri) {
+        throw new Error('Invalid audio URI');
+      }
+      await newSound.loadAsync(audioSource);
+      await newSound.playAsync();
+      setSound(newSound);
+      setIsPlaying(true);
+      setCurrentTrack(track);
+    } catch (error) {
+      console.error('Error playing track:', error);
+      Alert.alert('Error', 'Failed to play track');
+    }
+  };
+
+  // Clean up sound on unmount
+  useEffect(() => {
+    return () => {
+      if (sound) {
+        sound.unloadAsync().catch(error => console.error('Error unloading sound:', error));
+      }
+    };
+  }, [sound]);
+
+  // Render track item
+  const renderTrack = ({ item }) => (
+    <TouchableOpacity
+      style={styles.trackItem}
+      onPress={() => playTrack(item)}
+    >
+      <Image
+        source={item.image ? item.image : { uri: item.album_image }}
+        style={styles.trackArtwork}
+        defaultSource={PLACEHOLDER_IMAGE}
+      />
+      <View style={styles.trackInfo}>
+        <Text style={styles.trackTitle} numberOfLines={1}>
+          {item.name}
+        </Text>
+        <Text style={styles.trackArtist} numberOfLines={1}>
+          {item.artist_name}
+        </Text>
+        <View style={styles.trackMeta}>
+          <MaterialIcons name="audiotrack" size={16} color="#A3A3A3" />
+          <Text style={styles.trackDuration}>{formatDuration(item.duration)}</Text>
+        </View>
+      </View>
+      <View style={styles.trackActions}>
+        <TouchableOpacity onPress={() => toggleFavorite(item.id)}>
+          <FontAwesome
+            name={favorites[item.id] ? 'heart' : 'heart-o'}
+            size={20}
+            color={favorites[item.id] ? '#EF4444' : '#A3A3A3'}
+          />
+        </TouchableOpacity>
+        <FontAwesome
+          name={currentTrack?.id === item.id && isPlaying ? 'pause-circle' : 'play-circle'}
+          size={28}
+          color={currentTrack?.id === item.id && isPlaying ? '#EF4444' : '#3B82F6'}
+          style={styles.playIcon}
+        />
+      </View>
+    </TouchableOpacity>
+  );
+
+  // Format duration
+  const formatDuration = (seconds) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  // Render now playing section
+  const renderNowPlaying = () => {
+    if (!currentTrack) return null;
+    return (
+      <TouchableOpacity
+        style={styles.nowPlaying}
+        onPress={() =>
+          router.push({
+            pathname: '/player',
+            params: {
+              track: JSON.stringify(currentTrack),
+              trackList: JSON.stringify(filteredTracks),
+            },
+          })
+        }
+      >
+        <Image
+          source={currentTrack.image ? currentTrack.image : { uri: currentTrack.album_image }}
+          style={styles.nowPlayingArtwork}
+          defaultSource={PLACEHOLDER_IMAGE}
+        />
+        <View style={styles.nowPlayingInfo}>
+          <Text style={styles.nowPlayingTitle} numberOfLines={1}>
+            {currentTrack.name}
+          </Text>
+          <Text style={styles.nowPlayingArtist} numberOfLines={1}>
+            {currentTrack.artist_name}
+          </Text>
+        </View>
+        <TouchableOpacity onPress={() => playTrack(currentTrack)}>
+          <FontAwesome
+            name={isPlaying ? 'pause-circle' : 'play-circle'}
+            size={32}
+            color={isPlaying ? '#EF4444' : '#3B82F6'}
+          />
+        </TouchableOpacity>
+      </TouchableOpacity>
+    );
+  };
+
+  return (
+    <LinearGradient
+      colors={['#111827', '#1F2937']}
+      style={styles.container}
+    >
+      <View style={styles.header}>
+        <Text style={styles.title}>EchoPlay</Text>
+        <TextInput
+          style={styles.searchInput}
+          placeholder="Search songs or artists..."
+          placeholderTextColor="#9CA3AF"
+          value={searchQuery}
+          onChangeText={setSearchQuery}
+        />
+        <View style={styles.segmentedControl}>
+          <TouchableOpacity
+            style={[styles.segmentButton, activeSegment === 'all' && styles.activeSegment]}
+            onPress={() => setActiveSegment('all')}
+          >
+            <Text style={[styles.segmentText, activeSegment === 'all' && styles.activeSegmentText]}>
+              All Songs
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.segmentButton, activeSegment === 'device' && styles.activeSegment]}
+            onPress={() => setActiveSegment('device')}
+          >
+            <Text style={[styles.segmentText, activeSegment === 'device' && styles.activeSegmentText]}>
+              My Device
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      {!isConnected && (
+        <View style={styles.offlineWarning}>
+          <MaterialIcons name="signal-wifi-off" size={20} color="#FFF" />
+          <Text style={styles.offlineText}>Offline Mode - Showing local tracks</Text>
+        </View>
+      )}
+
+      {isLoading && !isRefreshing && (
+        <View style={styles.loadingContainer}>
+          <ActivityIndicator size="large" color="#3B82F6" />
+        </View>
+      )}
+
+      <FlatList
+        data={filteredTracks}
+        renderItem={renderTrack}
+        keyExtractor={item => item.id}
+        contentContainerStyle={styles.listContent}
+        refreshControl={
+          <RefreshControl
+            refreshing={isRefreshing}
+            onRefresh={onRefresh}
+            tintColor="#3B82F6"
+          />
+        }
+        ListEmptyComponent={
+          <Text style={styles.emptyText}>
+            {activeSegment === 'all'
+              ? isConnected
+                ? 'No online tracks available'
+                : 'Connect to load online tracks'
+              : hasPermission
+              ? 'No local tracks found'
+              : 'Media library permission denied'}
+          </Text>
+        }
+        ListFooterComponent={renderNowPlaying}
+      />
+    </LinearGradient>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    paddingTop: 60,
+    paddingHorizontal: 16,
+  },
+  header: {
+    marginBottom: 20,
+  },
+  title: {
+    fontSize: 32,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    textAlign: 'center',
+    marginBottom: 16,
+  },
+  searchInput: {
+    backgroundColor: '#374151',
+    color: '#FFFFFF',
+    borderRadius: 10,
+    padding: 12,
+    fontSize: 16,
+    marginBottom: 16,
+  },
+  segmentedControl: {
+    flexDirection: 'row',
+    backgroundColor: '#1F2937',
+    borderRadius: 10,
+    padding: 4,
+    marginHorizontal: 8,
+  },
+  segmentButton: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  activeSegment: {
+    backgroundColor: '#3B82F6',
+  },
+  segmentText: {
+    color: '#D1D5DB',
+    fontSize: 16,
+    fontWeight: '500',
+  },
+  activeSegmentText: {
+    color: '#FFFFFF',
+    fontWeight: '600',
+  },
+  trackItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+  trackArtwork: {
+    width: 60,
+    height: 60,
+    borderRadius: 10,
+    marginRight: 12,
+  },
+  trackInfo: {
+    flex: 1,
+    marginRight: 12,
+  },
+  trackTitle: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  trackArtist: {
+    color: '#9CA3AF',
+    fontSize: 14,
+    marginBottom: 4,
+  },
+  trackMeta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  trackDuration: {
+    color: '#9CA3AF',
+    fontSize: 12,
+  },
+  trackActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 16,
+  },
+  playIcon: {
+    marginRight: 8,
+  },
+  listContent: {
+    paddingBottom: 80,
+  },
+  emptyText: {
+    color: '#9CA3AF',
+    textAlign: 'center',
+    fontSize: 16,
+    marginTop: 40,
+  },
+  offlineWarning: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: '#EF4444',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  offlineText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginTop: 20,
+  },
+  nowPlaying: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.1)',
+    borderRadius: 12,
+    padding: 12,
+    marginTop: 12,
+    marginBottom: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+  nowPlayingArtwork: {
+    width: 50,
+    height: 50,
+    borderRadius: 8,
+    marginRight: 12,
+  },
+  nowPlayingInfo: {
+    flex: 1,
+    marginRight: 12,
+  },
+  nowPlayingTitle: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  nowPlayingArtist: {
+    color: '#9CA3AF',
+    fontSize: 14,
+  },
+});
