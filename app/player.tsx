@@ -1,154 +1,129 @@
 import { FontAwesome, MaterialIcons } from '@expo/vector-icons';
 import Slider from '@react-native-community/slider';
-import { Audio } from 'expo-av';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import React, { useEffect, useState } from 'react';
-import { Alert, Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Alert, Image, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { usePlayback } from '../contexts/PlaybackContext';
 
 export default function PlayerScreen() {
   const router = useRouter();
   const { track, trackList } = useLocalSearchParams();
-  const [sound, setSound] = useState(null);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [position, setPosition] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const { play, pause, resume, seek, playNext, playPrevious, isPlaying, position, duration, currentTrack } = usePlayback();
   const [trackData, setTrackData] = useState(null);
   const [trackListData, setTrackListData] = useState([]);
   const [error, setError] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [debounceTimeout, setDebounceTimeout] = useState(null);
+
+  const isValidUrl = (url) => {
+    try {
+      new URL(url);
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   useEffect(() => {
     if (track) {
       try {
-        setTrackData(JSON.parse(track));
+        const parsedTrack = JSON.parse(track);
+        parsedTrack.album_image = parsedTrack.album_image && isValidUrl(parsedTrack.album_image) ? parsedTrack.album_image : null;
+        console.log('Parsed track:', parsedTrack.name, 'ID:', parsedTrack.id);
+        setTrackData(parsedTrack);
+        if (!currentTrack || currentTrack.id !== parsedTrack.id) {
+          play(parsedTrack, trackListData);
+        }
       } catch (error) {
+        console.error('Error parsing track:', error);
         setError('Invalid track data');
         Alert.alert('Error', 'Invalid track data', [{ text: 'OK', onPress: () => router.back() }]);
       }
     }
     if (trackList) {
       try {
-        setTrackListData(JSON.parse(trackList));
+        const parsedList = JSON.parse(trackList).map(t => ({
+          ...t,
+          album_image: t.album_image && isValidUrl(t.album_image) ? t.album_image : null,
+        }));
+        console.log('Parsed track list IDs:', parsedList.map(t => t.id));
+        setTrackListData(parsedList);
       } catch (error) {
-        console.warn('Invalid track list data');
+        console.error('Error parsing track list:', error);
+        setTrackListData([]);
       }
     }
-  }, [track, trackList]);
-
-  // Load and play audio with retry
-  const loadSound = async (newTrackData, retryCount = 0) => {
-    if (!newTrackData) return;
-    setError(null);
-    setIsLoading(true);
-    const newSound = new Audio.Sound();
-    try {
-      const audioSource = typeof newTrackData.audio === 'string' ? { uri: newTrackData.audio } : newTrackData.audio;
-      if (!audioSource.uri) {
-        throw new Error('Invalid audio URI');
-      }
-      await newSound.loadAsync(audioSource);
-      setSound(newSound);
-      const status = await newSound.getStatusAsync();
-      setDuration(status.durationMillis || 0);
-      await newSound.playAsync();
-      setIsPlaying(true);
-      setPosition(0);
-      setTrackData(newTrackData);
-
-      newSound.setOnPlaybackStatusUpdate(status => {
-        if (status.isLoaded) {
-          setPosition(status.positionMillis || 0);
-          setDuration(status.durationMillis || 0);
-          setIsPlaying(status.isPlaying);
-        }
-      });
-    } catch (error) {
-      console.error('Error loading sound:', error);
-      if (retryCount < 2) {
-        setTimeout(() => loadSound(newTrackData, retryCount + 1), 1000);
-      } else {
-        setError('Failed to load audio file');
-        Alert.alert('Error', 'Failed to load audio file', [{ text: 'OK' }]);
-      }
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  }, [track, trackList, play]);
 
   useEffect(() => {
-    if (trackData) {
-      loadSound(trackData);
+    if (currentTrack?.trackList) {
+      console.log('Current track list IDs:', currentTrack.trackList.map(t => t.id));
+      setTrackListData(currentTrack.trackList);
     }
-    return () => {
-      if (sound) {
-        sound.stopAsync().catch(() => {});
-        sound.unloadAsync().catch(error => console.error('Error unloading sound:', error));
-      }
-    };
-  }, [trackData]);
+  }, [currentTrack]);
 
-  // Toggle play/pause
   const togglePlay = async () => {
-    if (!sound || isLoading) return;
+    if (isLoading) return;
+    setIsLoading(true);
     try {
-      const status = await sound.getStatusAsync();
-      if (status.isLoaded) {
-        if (isPlaying) {
-          await sound.pauseAsync();
-          setIsPlaying(false);
-        } else {
-          await sound.playAsync();
-          setIsPlaying(true);
-        }
+      if (isPlaying) {
+        await pause();
+      } else {
+        await resume();
       }
     } catch (error) {
       console.error('Error toggling play:', error);
       setError('Failed to toggle playback');
       Alert.alert('Error', 'Failed to toggle playback', [{ text: 'OK' }]);
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  // Seek to position
   const onSeek = async (value) => {
-    if (!sound || isLoading) return;
+    if (isLoading) return;
+    setIsLoading(true);
     try {
-      await sound.setPositionAsync(value);
-      setPosition(value);
+      await seek(value);
     } catch (error) {
       console.error('Error seeking:', error);
       setError('Failed to seek');
       Alert.alert('Error', 'Failed to seek', [{ text: 'OK' }]);
+    } finally {
+      setIsLoading(false);
     }
   };
 
-  // Play next track
-  const playNext = () => {
-    if (!trackListData.length || isLoading) return;
-    const currentIndex = trackListData.findIndex(t => t.id === trackData?.id);
-    if (currentIndex < trackListData.length - 1) {
-      const nextTrack = trackListData[currentIndex + 1];
-      loadSound(nextTrack);
-    }
+  const debounce = (func, delay) => {
+    return (...args) => {
+      if (debounceTimeout) {
+        clearTimeout(debounceTimeout);
+      }
+      setIsLoading(true);
+      const timeout = setTimeout(async () => {
+        try {
+          await func(...args);
+        } finally {
+          setIsLoading(false);
+        }
+      }, delay);
+      setDebounceTimeout(timeout);
+    };
   };
 
-  // Play previous track
-  const playPrevious = () => {
-    if (!trackListData.length || isLoading) return;
-    const currentIndex = trackListData.findIndex(t => t.id === trackData?.id);
-    if (currentIndex > 0) {
-      const prevTrack = trackListData[currentIndex - 1];
-      loadSound(prevTrack);
-    }
-  };
+  const debouncedPlayNext = debounce(playNext, 500);
+  const debouncedPlayPrevious = debounce(playPrevious, 500);
 
-  // Format time
   const formatTime = (millis) => {
     const seconds = Math.floor(millis / 1000);
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
+
+  const canGoNext = currentTrack?.trackList?.length > 1 && trackListData.findIndex(t => t.id === currentTrack?.id) < trackListData.length - 1;
+  const canGoPrevious = currentTrack?.trackList?.length > 1 && trackListData.findIndex(t => t.id === currentTrack?.id) > 0;
 
   if (!trackData || error) {
     return (
@@ -161,16 +136,18 @@ export default function PlayerScreen() {
     );
   }
 
+  const PLACEHOLDER_IMAGE = require('../assets/images/placeholder.jpg');
+
   return (
     <LinearGradient colors={['#111827', '#1F2937']} style={styles.container}>
       <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
         <MaterialIcons name="arrow-back" size={28} color="#FFFFFF" />
       </TouchableOpacity>
       <Image
-        source={trackData.image ? trackData.image : { uri: trackData.album_image }}
+        source={trackData.image || (trackData.album_image ? { uri: trackData.album_image } : PLACEHOLDER_IMAGE)}
         style={styles.artwork}
-        defaultSource={require('../assets/images/placeholder.jpg')}
-        onError={() => console.warn('Failed to load image')}
+        defaultSource={PLACEHOLDER_IMAGE}
+        onError={() => console.warn(`Failed to load image for track: ${trackData.name}, album_image: ${trackData.album_image}`)}
       />
       <View style={styles.trackInfo}>
         <Text style={styles.trackTitle} numberOfLines={1}>
@@ -190,7 +167,7 @@ export default function PlayerScreen() {
           minimumTrackTintColor="#3B82F6"
           maximumTrackTintColor="#4B5563"
           thumbTintColor="#3B82F6"
-          disabled={!sound || isLoading}
+          disabled={isLoading}
         />
         <View style={styles.timeContainer}>
           <Text style={styles.timeText}>{formatTime(position)}</Text>
@@ -198,25 +175,25 @@ export default function PlayerScreen() {
         </View>
       </View>
       <View style={styles.controls}>
-        <TouchableOpacity onPress={playPrevious} disabled={!sound || isLoading || !trackListData.length}>
+        <TouchableOpacity onPress={debouncedPlayPrevious} disabled={isLoading || !canGoPrevious}>
           <FontAwesome
             name="step-backward"
             size={32}
-            color={sound && !isLoading && trackListData.length ? '#3B82F6' : '#6B7280'}
+            color={isLoading || !canGoPrevious ? '#6B7280' : '#F97316'}
           />
         </TouchableOpacity>
-        <TouchableOpacity onPress={togglePlay} disabled={!sound || isLoading}>
+        <TouchableOpacity onPress={togglePlay} disabled={isLoading}>
           <FontAwesome
             name={isPlaying ? 'pause-circle' : 'play-circle'}
             size={64}
-            color={sound && !isLoading ? '#3B82F6' : '#6B7280'}
+            color={isLoading ? '#6B7280' : '#F97316'}
           />
         </TouchableOpacity>
-        <TouchableOpacity onPress={playNext} disabled={!sound || isLoading || !trackListData.length}>
+        <TouchableOpacity onPress={debouncedPlayNext} disabled={isLoading || !canGoNext}>
           <FontAwesome
             name="step-forward"
             size={32}
-            color={sound && !isLoading && trackListData.length ? '#3B82F6' : '#6B7280'}
+            color={isLoading || !canGoNext ? '#6B7280' : '#F97316'}
           />
         </TouchableOpacity>
       </View>

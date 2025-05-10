@@ -1,6 +1,5 @@
 import { FontAwesome, MaterialIcons } from '@expo/vector-icons';
 import NetInfo from '@react-native-community/netinfo';
-import { Audio } from 'expo-av';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as MediaLibrary from 'expo-media-library';
 import { useRouter } from 'expo-router';
@@ -17,9 +16,11 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { usePlayback } from '../contexts/PlaybackContext';
 
 export default function PlayScreen() {
   const router = useRouter();
+  const { play, pause, resume, isPlaying, currentTrack } = usePlayback();
   const [tracks, setTracks] = useState([]);
   const [localTracks, setLocalTracks] = useState([]);
   const [filteredTracks, setFilteredTracks] = useState([]);
@@ -29,14 +30,21 @@ export default function PlayScreen() {
   const [isLoading, setIsLoading] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [favorites, setFavorites] = useState({});
-  const [currentTrack, setCurrentTrack] = useState(null);
-  const [sound, setSound] = useState(null);
-  const [isPlaying, setIsPlaying] = useState(false);
   const [hasPermission, setHasPermission] = useState(null);
 
   const JAMENDO_CLIENT_ID = 'a74cceda';
   const JAMENDO_API_URL = `https://api.jamendo.com/v3.0/tracks/?client_id=${JAMENDO_CLIENT_ID}&format=json&limit=10`;
   const PLACEHOLDER_IMAGE = require('../assets/images/placeholder.jpg');
+
+  // Validate URL
+  const isValidUrl = (url) => {
+    try {
+      new URL(url);
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   // Request media library permissions
   useEffect(() => {
@@ -64,6 +72,7 @@ export default function PlayScreen() {
         .map(track => ({
           ...track,
           audio: { uri: track.audio },
+          album_image: track.album_image && isValidUrl(track.album_image) ? track.album_image : null,
         }));
       setTracks(validTracks);
       setFilteredTracks(validTracks);
@@ -86,16 +95,6 @@ export default function PlayScreen() {
     }
   };
 
-  // Validate URL
-  const isValidUrl = (url) => {
-    try {
-      new URL(url);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
   // Fetch local tracks from device
   const fetchLocalTracks = async () => {
     if (!hasPermission) {
@@ -114,7 +113,7 @@ export default function PlayScreen() {
         artist_name: asset.filename.split('-')[0]?.trim() || 'Unknown Artist',
         duration: asset.duration || 0,
         audio: { uri: asset.uri },
-        image: asset.uri ? { uri: asset.uri } : PLACEHOLDER_IMAGE,
+        image: null, // Audio files don’t have images; use placeholder
       }));
       setLocalTracks(localTracks);
       setFilteredTracks(localTracks);
@@ -173,53 +172,18 @@ export default function PlayScreen() {
     }));
   };
 
-  // Play or stop track
+  // Play or pause track
   const playTrack = async (track) => {
     if (!track.audio) {
       Alert.alert('Error', 'Invalid audio source');
       return;
     }
-
     if (currentTrack?.id === track.id && isPlaying) {
-      if (sound) {
-        await sound.stopAsync();
-        await sound.unloadAsync();
-        setSound(null);
-        setIsPlaying(false);
-        setCurrentTrack(null);
-      }
-      return;
-    }
-
-    if (sound) {
-      await sound.stopAsync();
-      await sound.unloadAsync();
-    }
-    const newSound = new Audio.Sound();
-    try {
-      const audioSource = typeof track.audio === 'string' ? { uri: track.audio } : track.audio;
-      if (!audioSource.uri) {
-        throw new Error('Invalid audio URI');
-      }
-      await newSound.loadAsync(audioSource);
-      await newSound.playAsync();
-      setSound(newSound);
-      setIsPlaying(true);
-      setCurrentTrack(track);
-    } catch (error) {
-      console.error('Error playing track:', error);
-      Alert.alert('Error', 'Failed to play track');
+      await pause();
+    } else {
+      await play(track, filteredTracks);
     }
   };
-
-  // Clean up sound on unmount
-  useEffect(() => {
-    return () => {
-      if (sound) {
-        sound.unloadAsync().catch(error => console.error('Error unloading sound:', error));
-      }
-    };
-  }, [sound]);
 
   // Render track item
   const renderTrack = ({ item }) => (
@@ -228,9 +192,10 @@ export default function PlayScreen() {
       onPress={() => playTrack(item)}
     >
       <Image
-        source={item.image ? item.image : { uri: item.album_image }}
+        source={item.image || (item.album_image ? { uri: item.album_image } : PLACEHOLDER_IMAGE)}
         style={styles.trackArtwork}
         defaultSource={PLACEHOLDER_IMAGE}
+        onError={() => console.warn(`Failed to load image for track: ${item.name}, album_image: ${item.album_image}`)}
       />
       <View style={styles.trackInfo}>
         <Text style={styles.trackTitle} numberOfLines={1}>
@@ -255,7 +220,7 @@ export default function PlayScreen() {
         <FontAwesome
           name={currentTrack?.id === item.id && isPlaying ? 'pause-circle' : 'play-circle'}
           size={28}
-          color={currentTrack?.id === item.id && isPlaying ? '#EF4444' : '#3B82F6'}
+          color={currentTrack?.id === item.id && isPlaying ? '#EF4444' : '#F97316'}
           style={styles.playIcon}
         />
       </View>
@@ -286,9 +251,10 @@ export default function PlayScreen() {
         }
       >
         <Image
-          source={currentTrack.image ? currentTrack.image : { uri: currentTrack.album_image }}
+          source={currentTrack.image || (currentTrack.album_image ? { uri: currentTrack.album_image } : PLACEHOLDER_IMAGE)}
           style={styles.nowPlayingArtwork}
           defaultSource={PLACEHOLDER_IMAGE}
+          onError={() => console.warn(`Failed to load now playing image for track: ${currentTrack.name}, album_image: ${currentTrack.album_image}`)}
         />
         <View style={styles.nowPlayingInfo}>
           <Text style={styles.nowPlayingTitle} numberOfLines={1}>
@@ -423,7 +389,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   activeSegment: {
-    backgroundColor: '#3B82F6',
+    backgroundColor: '#F97316',
   },
   segmentText: {
     color: '#D1D5DB',
