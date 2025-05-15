@@ -1,13 +1,11 @@
 import { FontAwesome, MaterialIcons } from '@expo/vector-icons';
 import NetInfo from '@react-native-community/netinfo';
 import { LinearGradient } from 'expo-linear-gradient';
-import * as Linking from 'expo-linking';
 import * as MediaLibrary from 'expo-media-library';
 import { useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   FlatList,
   Image,
   RefreshControl,
@@ -28,21 +26,18 @@ async function fetchWebApi(endpoint: string) {
     }
     return await res.json();
   } catch (error) {
-    console.error('Fetch error:', error);
     throw error;
   }
 }
 
 // Fetch tracks from Jamendo
-async function getOnlineTracks() {
+async function getOnlineTracks(offset = 0, limit = 100) {
   try {
-    // Replace YOUR_CLIENT_ID with your Jamendo API client ID
-    const clientId = 'a31365c7'; // Register at https://developer.jamendo.com/
-    const data = await fetchWebApi(`/tracks/?client_id=${clientId}&format=json&limit=50&order=downloads_total`);
-    console.log('Jamendo tracks response:', data); // Debug log
+    const clientId = 'a31365c7'; // Your Jamendo API client ID
+    const data = await fetchWebApi(`/tracks/?client_id=${clientId}&format=json&limit=${limit}&offset=${offset}&order=downloads_total`);
+    console.log('Jamendo tracks response:', { offset, count: data.results.length, audioFields: data.results.map(t => t.audio) });
     return data.results;
   } catch (error) {
-    console.error('Error fetching Jamendo tracks:', error);
     throw error;
   }
 }
@@ -60,17 +55,37 @@ export default function PlayScreen() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [favorites, setFavorites] = useState({});
   const [hasPermission, setHasPermission] = useState(null);
+  const [pageOffset, setPageOffset] = useState(0);
+  const [hasMoreTracks, setHasMoreTracks] = useState(true);
+  const [errorMessage, setErrorMessage] = useState(null);
 
   const PLACEHOLDER_IMAGE = require('../assets/images/placeholder.jpg');
 
   // Validate URL
   const isValidUrl = (url: string) => {
+    if (!url || typeof url !== 'string') {
+      console.log('Invalid URL:', url);
+      return false;
+    }
     try {
       new URL(url);
       return true;
-    } catch {
+    } catch (error) {
+      console.log('Invalid URL:', url, error);
       return false;
     }
+  };
+
+  // Validate track
+  const isValidTrack = (track: any) => {
+    return (
+      track &&
+      track.id &&
+      track.name &&
+      track.audio &&
+      track.audio.uri &&
+      isValidUrl(track.audio.uri)
+    );
   };
 
   // Request media library permissions
@@ -79,32 +94,25 @@ export default function PlayScreen() {
       const { status } = await MediaLibrary.requestPermissionsAsync();
       setHasPermission(status === 'granted');
       if (status !== 'granted') {
-        Alert.alert(
-          'Permission Denied',
-          'Media library access is limited in Expo Go. Create a development build for full access or grant permission.',
-          [
-            { text: 'OK', style: 'cancel' },
-            {
-              text: 'Learn More',
-              onPress: () => Linking.openURL('https://docs.expo.dev/develop/development-builds/create-a-build'),
-            },
-          ]
+        setErrorMessage(
+          'Media library access is limited in Expo Go. Create a development build for full access or grant permission.'
         );
       }
     })();
   }, []);
 
   // Fetch online tracks
-  const fetchTracks = async (isRetry = false) => {
+  const fetchTracks = async (isRetry = false, append = false) => {
     if (!isConnected) {
       setTracks([]);
       setFilteredTracks([]);
-      Alert.alert('Offline', 'No internet connection. Showing local tracks only.');
+      setErrorMessage('No internet connection. Showing local tracks only.');
       return;
     }
     setIsLoading(true);
+    setErrorMessage(null);
     try {
-      let onlineTracks = await getOnlineTracks();
+      let onlineTracks = await getOnlineTracks(pageOffset);
       let validTracks = onlineTracks
         .filter((track: any) => track && track.audio && isValidUrl(track.audio))
         .map((track: any) => ({
@@ -117,26 +125,33 @@ export default function PlayScreen() {
           isPreview: false,
         }));
 
-      if (validTracks.length === 0) {
-        Alert.alert('Warning', 'No tracks with valid URLs found.');
+      // Deduplicate tracks by ID
+      const trackIds = new Set(tracks.map(t => t.id));
+      validTracks = validTracks.filter(track => !trackIds.has(track.id));
+
+      console.log(`Fetched ${onlineTracks.length} tracks, ${validTracks.length} valid after filtering`);
+
+      if (validTracks.length === 0 && tracks.length === 0) {
+        setErrorMessage('No tracks with valid URLs found. Retrying with next page...');
+        setPageOffset(prev => prev + 100);
+        setTimeout(() => fetchTracks(isRetry, append), 2000);
+        return;
       } else if (validTracks.length < onlineTracks.length) {
-        Alert.alert('Notice', `${onlineTracks.length - validTracks.length} tracks lack valid URLs and are excluded.`);
+        setErrorMessage(`${onlineTracks.length - validTracks.length} tracks lack valid URLs and are excluded.`);
       }
 
-      setTracks(validTracks);
-      setFilteredTracks(validTracks);
+      setTracks(prev => (append ? [...prev, ...validTracks] : validTracks));
+      setFilteredTracks(prev => (append ? [...prev, ...validTracks] : validTracks));
+      setHasMoreTracks(validTracks.length === 100);
     } catch (error) {
       console.error('Error fetching online tracks:', error);
-      const errorMessage = error.message.includes('YOUR_CLIENT_ID')
-        ? 'Invalid Jamendo client ID. Please register at https://developer.jamendo.com/ and update the client ID in the code.'
-        : 'Failed to load online tracks. Please check your network or try again later.';
+      const errorMsg =
+        error.message === 'HTTP error! status: 401'
+          ? 'Invalid Jamendo client ID. Please verify your client ID at https://developer.jamendo.com/.'
+          : 'Failed to load online tracks. Please check your network or try again later.';
+      setErrorMessage(errorMsg);
       if (!isRetry) {
-        Alert.alert('Error', errorMessage, [
-          { text: 'Cancel', style: 'cancel' },
-          { text: 'Retry', onPress: () => fetchTracks(true) },
-        ]);
-      } else {
-        Alert.alert('Error', errorMessage);
+        setTimeout(() => fetchTracks(true, append), 2000);
       }
     } finally {
       setIsLoading(false);
@@ -168,20 +183,28 @@ export default function PlayScreen() {
       setLocalTracks(localTracks);
       setFilteredTracks(localTracks);
     } catch (error) {
-      console.error('Error fetching local tracks:', error);
-      Alert.alert('Error', 'Failed to load local tracks');
+      setErrorMessage('Failed to load local tracks.');
     }
   };
 
   // Handle pull-to-refresh
   const onRefresh = () => {
     setIsRefreshing(true);
+    setPageOffset(0);
+    setHasMoreTracks(true);
     if (activeSegment === 'all') {
-      fetchTracks();
+      fetchTracks(false, false);
     } else {
       fetchLocalTracks();
       setIsRefreshing(false);
     }
+  };
+
+  // Load more tracks on reaching end
+  const loadMoreTracks = () => {
+    if (isLoading || !hasMoreTracks || activeSegment !== 'all') return;
+    setPageOffset(prev => prev + 100);
+    fetchTracks(false, true);
   };
 
   // Initial data fetch
@@ -198,19 +221,29 @@ export default function PlayScreen() {
     return () => unsubscribe();
   }, []);
 
+  // Clear search query on segment change
+  useEffect(() => {
+    setSearchQuery('');
+  }, [activeSegment]);
+
   // Filter tracks based on search query
   useEffect(() => {
     const data = activeSegment === 'all' ? tracks : localTracks;
     if (searchQuery.trim() === '') {
       setFilteredTracks(data);
+      setErrorMessage(tracks.length > 0 ? null : errorMessage); // Preserve error if no tracks
     } else {
       const query = searchQuery.toLowerCase();
       const filtered = data.filter(
         (track: any) =>
-          track.name.toLowerCase().includes(query) ||
-          track.artist_name.toLowerCase().includes(query)
+          track.name.toLowerCase().includes(query) || track.artist_name.toLowerCase().includes(query)
       );
       setFilteredTracks(filtered);
+      if (filtered.length === 0 && tracks.length > 0) {
+        setErrorMessage('No tracks match your search. Try a different query.');
+      } else {
+        setErrorMessage(null);
+      }
     }
   }, [searchQuery, tracks, localTracks, activeSegment]);
 
@@ -224,14 +257,25 @@ export default function PlayScreen() {
 
   // Play or pause track
   const playTrack = async (track: any) => {
-    if (!track.audio) {
-      Alert.alert('Error', 'Invalid audio source');
+    if (!isValidTrack(track)) {
+      setErrorMessage('Invalid track data. Please select another track.');
       return;
     }
-    if (currentTrack?.id === track.id && isPlaying) {
-      await pause();
-    } else {
-      await play(track, filteredTracks);
+    try {
+      if (currentTrack?.id === track.id && isPlaying) {
+        await pause();
+      } else {
+        await play(track, filteredTracks);
+        router.push({
+          pathname: '/player',
+          params: {
+            track: JSON.stringify(track),
+            trackList: JSON.stringify(filteredTracks),
+          },
+        });
+      }
+    } catch (error) {
+      setErrorMessage('Failed to play track. Please try again.');
     }
   };
 
@@ -288,7 +332,7 @@ export default function PlayScreen() {
 
   // Render now playing section
   const renderNowPlaying = () => {
-    if (!currentTrack) return null;
+    if (!isValidTrack(currentTrack)) return null;
     return (
       <TouchableOpacity
         style={styles.nowPlaying}
@@ -327,6 +371,28 @@ export default function PlayScreen() {
     );
   };
 
+  // Render error message
+  const renderError = () => {
+    if (!errorMessage) return null;
+    return (
+      <View style={styles.errorContainer}>
+        <MaterialIcons name="error-outline" size={20} color="#FFF" />
+        <Text style={styles.errorText}>{errorMessage}</Text>
+        <TouchableOpacity
+          onPress={() => {
+            setErrorMessage(null);
+            if (errorMessage.includes('tracks lack valid URLs')) {
+              setPageOffset(prev => prev + 100);
+              fetchTracks(false, true);
+            }
+          }}
+        >
+          <MaterialIcons name={errorMessage.includes('tracks lack valid URLs') ? 'refresh' : 'close'} size={20} color="#FFF" />
+        </TouchableOpacity>
+      </View>
+    );
+  };
+
   return (
     <LinearGradient colors={['#111827', '#1F2937']} style={styles.container}>
       <View style={styles.header}>
@@ -361,6 +427,8 @@ export default function PlayScreen() {
         </View>
       )}
 
+      {renderError()}
+
       {isLoading && !isRefreshing && (
         <View style={styles.loadingContainer}>
           <ActivityIndicator size="large" color="#3B82F6" />
@@ -370,9 +438,11 @@ export default function PlayScreen() {
       <FlatList
         data={filteredTracks}
         renderItem={renderTrack}
-        keyExtractor={(item: any) => item.id}
+        keyExtractor={(item: any, index: number) => `${item.id}-${index}-${pageOffset}`}
         contentContainerStyle={styles.listContent}
         refreshControl={<RefreshControl refreshing={isRefreshing} onRefresh={onRefresh} tintColor="#3B82F6" />}
+        onEndReached={loadMoreTracks}
+        onEndReachedThreshold={0.5}
         ListEmptyComponent={
           <Text style={styles.emptyText}>
             {activeSegment === 'all'
@@ -553,5 +623,22 @@ const styles = StyleSheet.create({
   nowPlayingArtist: {
     color: '#9CA3AF',
     fontSize: 14,
+  },
+  errorContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#EF4444',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+    marginHorizontal: 8,
+  },
+  errorText: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '500',
+    flex: 1,
+    marginHorizontal: 8,
   },
 });
