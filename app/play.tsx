@@ -1,11 +1,12 @@
+
 import { FontAwesome, MaterialIcons } from '@expo/vector-icons';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as MediaLibrary from 'expo-media-library';
 import { useRouter } from 'expo-router';
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
   FlatList,
   Image,
   RefreshControl,
@@ -20,7 +21,7 @@ import { usePlayback } from '../contexts/PlaybackContext';
 // Jamendo API fetch function
 async function fetchWebApi(endpoint: string) {
   try {
-    const res = await fetch(`https://api.jamendo.com/v3.0${endpoint}`);
+   const res = await fetch(`https://api.jamendo.com/v3.0${endpoint}`);
     if (!res.ok) {
       throw new Error(`HTTP error! status: ${res.status}`);
     }
@@ -31,15 +32,17 @@ async function fetchWebApi(endpoint: string) {
 }
 
 // Fetch tracks from Jamendo
-async function getOnlineTracks(offset = 0, limit = 100, searchQuery = '') {
+async function getOnlineTracks(offset = 0, limit = 100, searchQuery = '', genres = []) {
   try {
-    const clientId = 'a31365c7'; // Your Jamendo API client ID
+    const clientId = 'a31365c7';
     const queryParam = searchQuery ? `&namesearch=${encodeURIComponent(searchQuery)}` : '';
-    const endpoint = `/tracks/?client_id=${clientId}&format=json&limit=${limit}&offset=${offset}&order=downloads_total${queryParam}`;
+    const genreParam = genres.length > 0 ? `&tags=${encodeURIComponent(genres.join('+'))}` : '';
+    const endpoint = `/tracks/?client_id=${clientId}&format=json&limit=${limit}&offset=${offset}&order=downloads_total${queryParam}${genreParam}`;
     const data = await fetchWebApi(endpoint);
     console.log('Jamendo tracks response:', {
       offset,
       searchQuery,
+      genres,
       count: data.results.length,
       audioFields: data.results.map(t => t.audio),
     });
@@ -51,23 +54,26 @@ async function getOnlineTracks(offset = 0, limit = 100, searchQuery = '') {
 
 export default function PlayScreen() {
   const router = useRouter();
-  const { play, pause, resume, isPlaying, currentTrack } = usePlayback();
+  const { play, pause, isPlaying, currentTrack } = usePlayback();
   const [tracks, setTracks] = useState([]);
   const [localTracks, setLocalTracks] = useState([]);
   const [filteredTracks, setFilteredTracks] = useState([]);
   const [isConnected, setIsConnected] = useState(true);
   const [activeSegment, setActiveSegment] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [favorites, setFavorites] = useState({});
   const [hasPermission, setHasPermission] = useState(null);
   const [pageOffset, setPageOffset] = useState(0);
   const [hasMoreTracks, setHasMoreTracks] = useState(true);
-  const [errorMessage, setErrorMessage] = useState(null);
-  const [retryCount, setRetryCount] = useState(0);
-  const MAX_RETRIES = 3;
+  const [selectedGenre, setSelectedGenre] = useState('');
+  const RATE_LIMIT_BACKOFF = 5000;
 
+  const searchTimeoutRef = useRef(null);
+  const updateTimeoutRef = useRef(null);
+  const fetchRef = useRef(false); // Prevent concurrent fetches
+
+  const GENRES = ['gospel', 'afrobeat', 'rap', 'pop', 'rock', 'jazz', 'classical', 'reggae'];
   const PLACEHOLDER_IMAGE = require('../assets/images/placeholder.jpg');
 
   // Validate URL
@@ -97,31 +103,104 @@ export default function PlayScreen() {
     );
   };
 
+  // Cache tracks to AsyncStorage
+  const cacheTracks = async (newTracks: any[]) => {
+    try {
+      const cached = await AsyncStorage.getItem('cachedTracks');
+      const existing = cached ? JSON.parse(cached) : [];
+      const updated = [...existing, ...newTracks].filter(
+        (track, index, self) => self.findIndex(t => t.id === track.id) === index
+      );
+      await AsyncStorage.setItem('cachedTracks', JSON.stringify(updated));
+      console.log('Cached tracks:', updated.length);
+    } catch (error) {
+      console.error('Error caching tracks:', error);
+    }
+  };
+
+  // Load cached tracks
+  const loadCachedTracks = async (query = '', genres = []) => {
+    try {
+      const cached = await AsyncStorage.getItem('cachedTracks');
+      if (cached) {
+        const allTracks = JSON.parse(cached);
+        let filtered = allTracks;
+        if (query) {
+          const q = query.toLowerCase();
+          filtered = allTracks.filter(
+            (track: any) =>
+              track.name.toLowerCase().includes(q) || track.artist_name.toLowerCase().includes(q)
+          );
+        }
+        if (genres.length > 0) {
+          filtered = filtered.filter((track: any) =>
+            genres.some(genre => track.name.toLowerCase().includes(genre) || track.artist_name.toLowerCase().includes(genre))
+          );
+        }
+        setTracks(filtered);
+        setFilteredTracks(filtered);
+        console.log('Loaded cached tracks:', filtered.length);
+        return filtered.length > 0;
+      }
+    } catch (error) {
+      console.error('Error loading cached tracks:', error);
+    }
+    return false;
+  };
+
+  // Clear cache
+  const clearCache = async () => {
+    try {
+      await AsyncStorage.removeItem('cachedTracks');
+      console.log('Cache cleared');
+      setTracks([]);
+      setFilteredTracks([]);
+    } catch (error) {
+      console.error('Error clearing cache:', error);
+    }
+  };
+
+  // Debounce search input
+  const debounceSearch = (query: string) => {
+    if (searchTimeoutRef.current) {
+      clearTimeout(searchTimeoutRef.current);
+    }
+    searchTimeoutRef.current = setTimeout(() => {
+      setSearchQuery(query);
+    }, 500);
+  };
+
+  // Debounce track updates
+  const debounceTrackUpdate = (newTracks: any[]) => {
+    if (updateTimeoutRef.current) {
+      clearTimeout(updateTimeoutRef.current);
+    }
+    updateTimeoutRef.current = setTimeout(() => {
+      console.log('Updating tracks:', newTracks.length);
+      setTracks(newTracks);
+      setFilteredTracks(newTracks);
+    }, 300);
+  };
+
   // Request media library permissions
   useEffect(() => {
     (async () => {
       const { status } = await MediaLibrary.requestPermissionsAsync();
       setHasPermission(status === 'granted');
-      if (status !== 'granted') {
-        setErrorMessage(
-          'Media library access is limited in Expo Go. Create a development build for full access or grant permission.'
-        );
-      }
     })();
   }, []);
 
   // Fetch online tracks
-  const fetchTracks = async (isRetry = false, append = false, query = '') => {
+  const fetchTracks = async (append = false, query = '', genres = []) => {
     if (!isConnected) {
-      setTracks([]);
-      setFilteredTracks([]);
-      setErrorMessage('No internet connection. Showing local tracks only.');
+      await loadCachedTracks(query, genres);
       return;
     }
-    setIsLoading(true);
-    setErrorMessage(null);
+    if (fetchRef.current) return;
+    fetchRef.current = true;
+
     try {
-      let onlineTracks = await getOnlineTracks(pageOffset, 100, query);
+      let onlineTracks = await getOnlineTracks(pageOffset, 100, query, genres);
       let validTracks = onlineTracks
         .filter((track: any) => track && track.audio && isValidUrl(track.audio))
         .map((track: any) => ({
@@ -140,36 +219,21 @@ export default function PlayScreen() {
 
       console.log(`Fetched ${onlineTracks.length} tracks, ${validTracks.length} valid after filtering`);
 
-      if (validTracks.length === 0 && retryCount < MAX_RETRIES) {
-        setErrorMessage(`No valid tracks found${query ? ' for search' : ''}. Retrying with next page...`);
-        setPageOffset(prev => prev + 100);
-        setRetryCount(prev => prev + 1);
-        setTimeout(() => fetchTracks(isRetry, append, query), 2000);
-        return;
-      } else if (validTracks.length === 0) {
-        setErrorMessage(`No valid tracks found${query ? ' for search' : ''} after retries. Try a different search or refresh.`);
-        setHasMoreTracks(false);
-      } else if (validTracks.length < onlineTracks.length) {
-        setErrorMessage(`${onlineTracks.length - validTracks.length} tracks lack valid URLs and are excluded.`);
-      }
-
-      setTracks(prev => (append ? [...prev, ...validTracks] : validTracks));
-      setFilteredTracks(prev => (append ? [...prev, ...validTracks] : validTracks));
+      await cacheTracks(validTracks);
+      const newTracks = append ? [...tracks, ...validTracks] : validTracks;
+      debounceTrackUpdate(newTracks);
       setHasMoreTracks(validTracks.length === 100);
-      setRetryCount(0); // Reset retry count on success
     } catch (error) {
       console.error('Error fetching tracks:', error);
-      const errorMsg =
-        error.message === 'HTTP error! status: 401'
-          ? 'Invalid Jamendo client ID. Please verify your client ID at https://developer.jamendo.com/.'
-          : `Failed to load tracks${query ? ' for search' : ''}. Please check your network or try again later.`;
-      setErrorMessage(errorMsg);
-      if (!isRetry && retryCount < MAX_RETRIES) {
-        setRetryCount(prev => prev + 1);
-        setTimeout(() => fetchTracks(true, append, query), 2000);
+      if (error.message.includes('status: 429')) {
+        setTimeout(() => {
+          fetchRef.current = false;
+          fetchTracks(append, query, genres);
+        }, RATE_LIMIT_BACKOFF);
       }
+      await loadCachedTracks(query, genres);
     } finally {
-      setIsLoading(false);
+      fetchRef.current = false;
       setIsRefreshing(false);
     }
   };
@@ -184,21 +248,22 @@ export default function PlayScreen() {
     try {
       const { assets } = await MediaLibrary.getAssetsAsync({
         mediaType: ['audio'],
-        first: 50,
+        first: 100,
       });
       const localTracks = assets.map((asset: any) => ({
         id: asset.id,
         name: asset.filename || 'Unknown Track',
-        artist_name: asset.filename.split('-')[0]?.trim() || 'Unknown Artist',
+        artist_name: asset.filename?.split('-')[0]?.trim() || 'Unknown Artist',
         duration: asset.duration || 0,
         audio: { uri: asset.uri },
         image: null,
         isPreview: false,
       }));
+      
       setLocalTracks(localTracks);
       setFilteredTracks(localTracks);
     } catch (error) {
-      setErrorMessage('Failed to load local tracks.');
+      console.error('Error fetching local tracks:', error);
     }
   };
 
@@ -207,9 +272,8 @@ export default function PlayScreen() {
     setIsRefreshing(true);
     setPageOffset(0);
     setHasMoreTracks(true);
-    setRetryCount(0);
     if (activeSegment === 'all') {
-      fetchTracks(false, false, searchQuery);
+      fetchTracks(false, searchQuery, selectedGenre ? [selectedGenre] : GENRES);
     } else {
       fetchLocalTracks();
       setIsRefreshing(false);
@@ -218,16 +282,20 @@ export default function PlayScreen() {
 
   // Load more tracks on reaching end
   const loadMoreTracks = () => {
-    if (isLoading || !hasMoreTracks || activeSegment !== 'all') return;
+    if (fetchRef.current || !hasMoreTracks || activeSegment !== 'all') return;
     setPageOffset(prev => prev + 100);
-    fetchTracks(false, true, searchQuery);
+    fetchTracks(true, searchQuery, selectedGenre ? [selectedGenre] : GENRES);
   };
 
-  // Initial data fetch
+  // Initial data fetch (run once)
   useEffect(() => {
-    fetchTracks();
+    fetchTracks(false, '', GENRES);
     fetchLocalTracks();
-  }, [isConnected, hasPermission]);
+    return () => {
+      if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+      if (updateTimeoutRef.current) clearTimeout(updateTimeoutRef.current);
+    };
+  }, []);
 
   // Network monitoring
   useEffect(() => {
@@ -237,46 +305,42 @@ export default function PlayScreen() {
     return () => unsubscribe();
   }, []);
 
-  // Clear search query on segment change
+  // Clear search query and genre on segment change
   useEffect(() => {
     setSearchQuery('');
+    setSelectedGenre('');
   }, [activeSegment]);
 
-  // Handle search
+  // Handle search and genre filtering
   useEffect(() => {
     if (activeSegment !== 'all') {
       const data = localTracks;
       if (searchQuery.trim() === '') {
         setFilteredTracks(data);
-        setErrorMessage(localTracks.length > 0 ? null : errorMessage);
       } else {
         const query = searchQuery.toLowerCase();
         const filtered = data.filter(
           (track: any) =>
             track.name.toLowerCase().includes(query) || track.artist_name.toLowerCase().includes(query)
         );
+        setTracks(filtered);
         setFilteredTracks(filtered);
-        if (filtered.length === 0 && localTracks.length > 0) {
-          setErrorMessage('No local tracks match your search. Try a different query.');
-        } else {
-          setErrorMessage(null);
-        }
       }
       return;
     }
 
-    if (searchQuery.trim() === '') {
+    const isGenreQuery = GENRES.includes(searchQuery.toLowerCase());
+    if (searchQuery.trim() === '' && !selectedGenre) {
       setPageOffset(0);
       setHasMoreTracks(true);
-      setRetryCount(0);
-      fetchTracks(false, false, '');
+      fetchTracks(false, '', GENRES);
     } else {
       setPageOffset(0);
       setHasMoreTracks(true);
-      setRetryCount(0);
-      fetchTracks(false, false, searchQuery);
+      const genres = isGenreQuery ? [searchQuery.toLowerCase()] : selectedGenre ? [selectedGenre] : [];
+      fetchTracks(false, isGenreQuery ? '' : searchQuery, genres);
     }
-  }, [searchQuery, activeSegment, localTracks]);
+  }, [searchQuery, selectedGenre, activeSegment, localTracks]);
 
   // Toggle favorite status
   const toggleFavorite = (trackId: string) => {
@@ -289,7 +353,6 @@ export default function PlayScreen() {
   // Play or pause track
   const playTrack = async (track: any) => {
     if (!isValidTrack(track)) {
-      setErrorMessage('Invalid track data. Please select another track.');
       return;
     }
     try {
@@ -306,52 +369,60 @@ export default function PlayScreen() {
         });
       }
     } catch (error) {
-      setErrorMessage('Failed to play track. Please try again.');
+      console.error('Error playing track:', error);
     }
   };
 
-  // Render track item
-  const renderTrack = ({ item }: { item: any }) => (
-    <TouchableOpacity
-      style={styles.trackItem}
-      onPress={() => playTrack(item)}
-      accessibilityLabel={`Play ${item.name} by ${item.artist_name}`}
-      accessibilityRole="button"
-    >
-      <Image
-        source={item.image || (item.album_image ? { uri: item.album_image } : PLACEHOLDER_IMAGE)}
-        style={styles.trackArtwork}
-        defaultSource={PLACEHOLDER_IMAGE}
-        onError={() => console.warn(`Failed to load image for track: ${item.name}`)}
-      />
-      <View style={styles.trackInfo}>
-        <Text style={styles.trackTitle} numberOfLines={1}>
-          {item.name}
-        </Text>
-        <Text style={styles.trackArtist} numberOfLines={1}>
-          {item.artist_name}
-        </Text>
-        <View style={styles.trackMeta}>
-          <MaterialIcons name="audiotrack" size={16} color="#A3A3A3" />
-          <Text style={styles.trackDuration}>{formatDuration(item.duration)}</Text>
-        </View>
-      </View>
-      <View style={styles.trackActions}>
-        <TouchableOpacity onPress={() => toggleFavorite(item.id)}>
-          <FontAwesome
-            name={favorites[item.id] ? 'heart' : 'heart-o'}
-            size={20}
-            color={favorites[item.id] ? '#EF4444' : '#A3A3A3'}
+  // Optimized renderTrack with memo
+  const RenderTrack = memo(
+    ({ item }: { item: any }) => {
+      return (
+        <TouchableOpacity
+          style={styles.trackItem}
+          onPress={() => playTrack(item)}
+          accessibilityLabel={`Play ${item.name} by ${item.artist_name}`}
+          accessibilityRole="button"
+        >
+          <Image
+            source={item.image || (item.album_image ? { uri: item.album_image } : PLACEHOLDER_IMAGE)}
+            style={styles.trackArtwork}
+            defaultSource={PLACEHOLDER_IMAGE}
+            onError={() => console.warn(`Failed to load image for track: ${item.name}`)}
           />
+          <View style={styles.trackInfo}>
+            <Text style={styles.trackTitle} numberOfLines={1}>
+              {item.name}
+            </Text>
+            <Text style={styles.trackArtist} numberOfLines={1}>
+              {item.artist_name}
+            </Text>
+            <View style={styles.trackMeta}>
+              <MaterialIcons name="audiotrack" size={16} color="#A3A3A3" />
+              <Text style={styles.trackDuration}>{formatDuration(item.duration)}</Text>
+            </View>
+          </View>
+          <View style={styles.trackActions}>
+            <TouchableOpacity onPress={() => toggleFavorite(item.id)}>
+              <FontAwesome
+                name={favorites[item.id] ? 'heart' : 'heart-o'}
+                size={20}
+                color={favorites[item.id] ? '#EF4444' : '#A3A3A3'}
+              />
+            </TouchableOpacity>
+            <FontAwesome
+              name={currentTrack?.id === item.id && isPlaying ? 'pause-circle' : 'play-circle'}
+              size={28}
+              color={currentTrack?.id === item.id && isPlaying ? '#EF4444' : '#F97316'}
+              style={styles.playIcon}
+            />
+          </View>
         </TouchableOpacity>
-        <FontAwesome
-          name={currentTrack?.id === item.id && isPlaying ? 'pause-circle' : 'play-circle'}
-          size={28}
-          color={currentTrack?.id === item.id && isPlaying ? '#EF4444' : '#F97316'}
-          style={styles.playIcon}
-        />
-      </View>
-    </TouchableOpacity>
+      );
+    },
+    (prevProps, nextProps) =>
+      prevProps.item.id === nextProps.item.id &&
+      prevProps.item.name === nextProps.item.name &&
+      prevProps.item.artist_name === nextProps.item.artist_name
   );
 
   // Format duration
@@ -359,6 +430,46 @@ export default function PlayScreen() {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  // Render genre buttons
+  const renderGenreButtons = () => (
+    <View style={styles.genreContainer}>
+      {GENRES.map(genre => (
+        <TouchableOpacity
+          key={genre}
+          style={[
+            styles.genreButton,
+            selectedGenre === genre && styles.activeGenreButton,
+          ]}
+          onPress={() => setSelectedGenre(genre === selectedGenre ? '' : genre)}
+        >
+          <Text
+            style={[
+              styles.genreText,
+              selectedGenre === genre && styles.activeGenreText,
+            ]}
+          >
+            {genre.charAt(0).toUpperCase() + genre.slice(1)}
+          </Text>
+        </TouchableOpacity>
+      ))}
+    </View>
+  );
+
+  // Render song count
+  const renderSongCount = () => {
+    if (filteredTracks.length === 0) return null;
+    const filterText = selectedGenre
+      ? selectedGenre.charAt(0).toUpperCase() + selectedGenre.slice(1)
+      : searchQuery
+      ? `"${searchQuery}"`
+      : 'All Genres';
+    return (
+      <Text style={styles.songCount}>
+        Showing {filteredTracks.length} song{filteredTracks.length !== 1 ? 's' : ''} for {filterText}
+      </Text>
+    );
   };
 
   // Render now playing section
@@ -402,48 +513,16 @@ export default function PlayScreen() {
     );
   };
 
-  // Render error message
-  const renderError = () => {
-    if (!errorMessage) return null;
-    return (
-      <View style={styles.errorContainer}>
-        <MaterialIcons name="error-outline" size={20} color="#FFF" />
-        <Text style={styles.errorText}>{errorMessage}</Text>
-        <TouchableOpacity
-          onPress={() => {
-            setErrorMessage(null);
-            if (errorMessage.includes('tracks lack valid URLs') || errorMessage.includes('Failed to load tracks')) {
-              setPageOffset(prev => prev + 100);
-              fetchTracks(false, true, searchQuery);
-            } else if (errorMessage.includes('No local tracks match')) {
-              setSearchQuery('');
-            }
-          }}
-        >
-          <MaterialIcons
-            name={
-              errorMessage.includes('tracks lack valid URLs') || errorMessage.includes('Failed to load tracks')
-                ? 'refresh'
-                : 'close'
-            }
-            size={20}
-            color="#FFF"
-          />
-        </TouchableOpacity>
-      </View>
-    );
-  };
-
   return (
     <LinearGradient colors={['#111827', '#1F2937']} style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.title}>EchoPlay</Text>
         <TextInput
           style={styles.searchInput}
-          placeholder="Search songs or artists..."
+          placeholder="Search songs, artists, or genres..."
           placeholderTextColor="#9CA3AF"
           value={searchQuery}
-          onChangeText={setSearchQuery}
+          onChangeText={debounceSearch}
         />
         <View style={styles.segmentedControl}>
           <TouchableOpacity
@@ -461,6 +540,8 @@ export default function PlayScreen() {
         </View>
       </View>
 
+      {activeSegment === 'all' && renderGenreButtons()}
+
       {!isConnected && (
         <View style={styles.offlineWarning}>
           <MaterialIcons name="signal-wifi-off" size={20} color="#FFF" />
@@ -468,22 +549,21 @@ export default function PlayScreen() {
         </View>
       )}
 
-      {renderError()}
-
-      {isLoading && !isRefreshing && (
-        <View style={styles.loadingContainer}>
-          <ActivityIndicator size="large" color="#3B82F6" />
-        </View>
-      )}
+      {renderSongCount()}
 
       <FlatList
         data={filteredTracks}
-        renderItem={renderTrack}
+        renderItem={({ item }) => <RenderTrack item={item} />}
         keyExtractor={(item: any, index: number) => `${item.id}-${index}-${pageOffset}`}
         contentContainerStyle={styles.listContent}
         refreshControl={<RefreshControl refreshing={isRefreshing} onRefresh={onRefresh} tintColor="#3B82F6" />}
         onEndReached={loadMoreTracks}
         onEndReachedThreshold={0.5}
+        getItemLayout={(data, index) => ({
+          length: 96,
+          offset: 96 * index,
+          index,
+        })}
         ListEmptyComponent={
           <Text style={styles.emptyText}>
             {activeSegment === 'all'
@@ -497,6 +577,12 @@ export default function PlayScreen() {
         }
         ListFooterComponent={renderNowPlaying}
       />
+
+      {activeSegment === 'all' && (
+        <TouchableOpacity style={styles.clearCacheButton} onPress={clearCache}>
+          <Text style={styles.clearCacheText}>Clear Cache</Text>
+        </TouchableOpacity>
+      )}
     </LinearGradient>
   );
 }
@@ -547,6 +633,31 @@ const styles = StyleSheet.create({
     fontWeight: '500',
   },
   activeSegmentText: {
+    color: '#FFFFFF',
+    fontWeight: '600',
+  },
+  genreContainer: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    marginBottom: 16,
+  },
+  genreButton: {
+    backgroundColor: '#1F2937',
+    borderRadius: 20,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    margin: 4,
+  },
+  activeGenreButton: {
+    backgroundColor: '#F97316',
+  },
+  genreText: {
+    color: '#D1D5DB',
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  activeGenreText: {
     color: '#FFFFFF',
     fontWeight: '600',
   },
@@ -625,11 +736,12 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '500',
   },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginTop: 20,
+  songCount: {
+    color: '#D1D5DB',
+    fontSize: 14,
+    fontWeight: '500',
+    textAlign: 'center',
+    marginBottom: 12,
   },
   nowPlaying: {
     flexDirection: 'row',
@@ -665,21 +777,16 @@ const styles = StyleSheet.create({
     color: '#9CA3AF',
     fontSize: 14,
   },
-  errorContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#EF4444',
+  clearCacheButton: {
+    backgroundColor: '#374151',
+    borderRadius: 10,
     padding: 12,
-    borderRadius: 8,
+    alignItems: 'center',
     marginBottom: 16,
-    marginHorizontal: 8,
   },
-  errorText: {
+  clearCacheText: {
     color: '#FFFFFF',
-    fontSize: 14,
-    fontWeight: '500',
-    flex: 1,
-    marginHorizontal: 8,
+    fontSize: 16,
+    fontWeight: '600',
   },
 });
