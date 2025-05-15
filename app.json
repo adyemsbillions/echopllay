@@ -43,7 +43,8 @@
           "savePhotosPermission": "Allow EchoPlay to save photos",
           "saveVideosPermission": "Allow EchoPlay to save videos"
         }
-      ]
+      ],
+      "expo-audio"
     ],
     "experiments": {
       "typedRoutes": true

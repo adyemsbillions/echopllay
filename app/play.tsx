@@ -1,6 +1,7 @@
 import { FontAwesome, MaterialIcons } from '@expo/vector-icons';
 import NetInfo from '@react-native-community/netinfo';
 import { LinearGradient } from 'expo-linear-gradient';
+import * as Linking from 'expo-linking';
 import * as MediaLibrary from 'expo-media-library';
 import { useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
@@ -18,6 +19,34 @@ import {
 } from 'react-native';
 import { usePlayback } from '../contexts/PlaybackContext';
 
+// Jamendo API fetch function
+async function fetchWebApi(endpoint: string) {
+  try {
+    const res = await fetch(`https://api.jamendo.com/v3.0${endpoint}`);
+    if (!res.ok) {
+      throw new Error(`HTTP error! status: ${res.status}`);
+    }
+    return await res.json();
+  } catch (error) {
+    console.error('Fetch error:', error);
+    throw error;
+  }
+}
+
+// Fetch tracks from Jamendo
+async function getOnlineTracks() {
+  try {
+    // Replace YOUR_CLIENT_ID with your Jamendo API client ID
+    const clientId = 'a31365c7'; // Register at https://developer.jamendo.com/
+    const data = await fetchWebApi(`/tracks/?client_id=${clientId}&format=json&limit=50&order=downloads_total`);
+    console.log('Jamendo tracks response:', data); // Debug log
+    return data.results;
+  } catch (error) {
+    console.error('Error fetching Jamendo tracks:', error);
+    throw error;
+  }
+}
+
 export default function PlayScreen() {
   const router = useRouter();
   const { play, pause, resume, isPlaying, currentTrack } = usePlayback();
@@ -32,12 +61,10 @@ export default function PlayScreen() {
   const [favorites, setFavorites] = useState({});
   const [hasPermission, setHasPermission] = useState(null);
 
-  const JAMENDO_CLIENT_ID = 'a74cceda';
-  const JAMENDO_API_URL = `https://api.jamendo.com/v3.0/tracks/?client_id=${JAMENDO_CLIENT_ID}&format=json&limit=10`;
   const PLACEHOLDER_IMAGE = require('../assets/images/placeholder.jpg');
 
   // Validate URL
-  const isValidUrl = (url) => {
+  const isValidUrl = (url: string) => {
     try {
       new URL(url);
       return true;
@@ -52,42 +79,64 @@ export default function PlayScreen() {
       const { status } = await MediaLibrary.requestPermissionsAsync();
       setHasPermission(status === 'granted');
       if (status !== 'granted') {
-        Alert.alert('Permission Denied', 'Please grant media library access to view local tracks.');
+        Alert.alert(
+          'Permission Denied',
+          'Media library access is limited in Expo Go. Create a development build for full access or grant permission.',
+          [
+            { text: 'OK', style: 'cancel' },
+            {
+              text: 'Learn More',
+              onPress: () => Linking.openURL('https://docs.expo.dev/develop/development-builds/create-a-build'),
+            },
+          ]
+        );
       }
     })();
   }, []);
 
-  // Fetch online tracks from Jamendo
+  // Fetch online tracks
   const fetchTracks = async (isRetry = false) => {
-    if (!isConnected) return;
+    if (!isConnected) {
+      setTracks([]);
+      setFilteredTracks([]);
+      Alert.alert('Offline', 'No internet connection. Showing local tracks only.');
+      return;
+    }
     setIsLoading(true);
     try {
-      const response = await fetch(JAMENDO_API_URL);
-      if (!response.ok) {
-        throw new Error('Network response was not ok');
-      }
-      const data = await response.json();
-      const validTracks = data.results
-        .filter(track => track.audio && isValidUrl(track.audio))
-        .map(track => ({
-          ...track,
+      let onlineTracks = await getOnlineTracks();
+      let validTracks = onlineTracks
+        .filter((track: any) => track && track.audio && isValidUrl(track.audio))
+        .map((track: any) => ({
+          id: track.id,
+          name: track.name || 'Unknown Track',
+          artist_name: track.artist_name || 'Unknown Artist',
+          duration: track.duration || 0,
           audio: { uri: track.audio },
-          album_image: track.album_image && isValidUrl(track.album_image) ? track.album_image : null,
+          album_image: track.image && isValidUrl(track.image) ? track.image : null,
+          isPreview: false,
         }));
+
+      if (validTracks.length === 0) {
+        Alert.alert('Warning', 'No tracks with valid URLs found.');
+      } else if (validTracks.length < onlineTracks.length) {
+        Alert.alert('Notice', `${onlineTracks.length - validTracks.length} tracks lack valid URLs and are excluded.`);
+      }
+
       setTracks(validTracks);
       setFilteredTracks(validTracks);
-      if (validTracks.length === 0 && data.results.length > 0) {
-        Alert.alert('Warning', 'No tracks with valid audio URLs found');
-      }
     } catch (error) {
-      console.error('Error fetching tracks:', error);
+      console.error('Error fetching online tracks:', error);
+      const errorMessage = error.message.includes('YOUR_CLIENT_ID')
+        ? 'Invalid Jamendo client ID. Please register at https://developer.jamendo.com/ and update the client ID in the code.'
+        : 'Failed to load online tracks. Please check your network or try again later.';
       if (!isRetry) {
-        Alert.alert('Error', 'Failed to load online tracks. Retry?', [
+        Alert.alert('Error', errorMessage, [
           { text: 'Cancel', style: 'cancel' },
           { text: 'Retry', onPress: () => fetchTracks(true) },
         ]);
       } else {
-        Alert.alert('Error', 'Failed to load online tracks');
+        Alert.alert('Error', errorMessage);
       }
     } finally {
       setIsLoading(false);
@@ -107,13 +156,14 @@ export default function PlayScreen() {
         mediaType: ['audio'],
         first: 50,
       });
-      const localTracks = assets.map(asset => ({
+      const localTracks = assets.map((asset: any) => ({
         id: asset.id,
         name: asset.filename || 'Unknown Track',
         artist_name: asset.filename.split('-')[0]?.trim() || 'Unknown Artist',
         duration: asset.duration || 0,
         audio: { uri: asset.uri },
-        image: null, // Audio files don’t have images; use placeholder
+        image: null,
+        isPreview: false,
       }));
       setLocalTracks(localTracks);
       setFilteredTracks(localTracks);
@@ -156,7 +206,7 @@ export default function PlayScreen() {
     } else {
       const query = searchQuery.toLowerCase();
       const filtered = data.filter(
-        track =>
+        (track: any) =>
           track.name.toLowerCase().includes(query) ||
           track.artist_name.toLowerCase().includes(query)
       );
@@ -165,15 +215,15 @@ export default function PlayScreen() {
   }, [searchQuery, tracks, localTracks, activeSegment]);
 
   // Toggle favorite status
-  const toggleFavorite = (trackId) => {
-    setFavorites(prev => ({
+  const toggleFavorite = (trackId: string) => {
+    setFavorites((prev: any) => ({
       ...prev,
       [trackId]: !prev[trackId],
     }));
   };
 
   // Play or pause track
-  const playTrack = async (track) => {
+  const playTrack = async (track: any) => {
     if (!track.audio) {
       Alert.alert('Error', 'Invalid audio source');
       return;
@@ -186,16 +236,18 @@ export default function PlayScreen() {
   };
 
   // Render track item
-  const renderTrack = ({ item }) => (
+  const renderTrack = ({ item }: { item: any }) => (
     <TouchableOpacity
       style={styles.trackItem}
       onPress={() => playTrack(item)}
+      accessibilityLabel={`Play ${item.name} by ${item.artist_name}`}
+      accessibilityRole="button"
     >
       <Image
         source={item.image || (item.album_image ? { uri: item.album_image } : PLACEHOLDER_IMAGE)}
         style={styles.trackArtwork}
         defaultSource={PLACEHOLDER_IMAGE}
-        onError={() => console.warn(`Failed to load image for track: ${item.name}, album_image: ${item.album_image}`)}
+        onError={() => console.warn(`Failed to load image for track: ${item.name}`)}
       />
       <View style={styles.trackInfo}>
         <Text style={styles.trackTitle} numberOfLines={1}>
@@ -228,7 +280,7 @@ export default function PlayScreen() {
   );
 
   // Format duration
-  const formatDuration = (seconds) => {
+  const formatDuration = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
@@ -254,7 +306,7 @@ export default function PlayScreen() {
           source={currentTrack.image || (currentTrack.album_image ? { uri: currentTrack.album_image } : PLACEHOLDER_IMAGE)}
           style={styles.nowPlayingArtwork}
           defaultSource={PLACEHOLDER_IMAGE}
-          onError={() => console.warn(`Failed to load now playing image for track: ${currentTrack.name}, album_image: ${currentTrack.album_image}`)}
+          onError={() => console.warn(`Failed to load now playing image for track: ${currentTrack.name}`)}
         />
         <View style={styles.nowPlayingInfo}>
           <Text style={styles.nowPlayingTitle} numberOfLines={1}>
@@ -276,10 +328,7 @@ export default function PlayScreen() {
   };
 
   return (
-    <LinearGradient
-      colors={['#111827', '#1F2937']}
-      style={styles.container}
-    >
+    <LinearGradient colors={['#111827', '#1F2937']} style={styles.container}>
       <View style={styles.header}>
         <Text style={styles.title}>EchoPlay</Text>
         <TextInput
@@ -294,17 +343,13 @@ export default function PlayScreen() {
             style={[styles.segmentButton, activeSegment === 'all' && styles.activeSegment]}
             onPress={() => setActiveSegment('all')}
           >
-            <Text style={[styles.segmentText, activeSegment === 'all' && styles.activeSegmentText]}>
-              All Songs
-            </Text>
+            <Text style={[styles.segmentText, activeSegment === 'all' && styles.activeSegmentText]}>Online</Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={[styles.segmentButton, activeSegment === 'device' && styles.activeSegment]}
             onPress={() => setActiveSegment('device')}
           >
-            <Text style={[styles.segmentText, activeSegment === 'device' && styles.activeSegmentText]}>
-              My Device
-            </Text>
+            <Text style={[styles.segmentText, activeSegment === 'device' && styles.activeSegmentText]}>My Device</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -312,7 +357,7 @@ export default function PlayScreen() {
       {!isConnected && (
         <View style={styles.offlineWarning}>
           <MaterialIcons name="signal-wifi-off" size={20} color="#FFF" />
-          <Text style={styles.offlineText}>Offline Mode - Showing local tracks</Text>
+          <Text style={styles.offlineText}>Offline Mode - Showing local tracks only</Text>
         </View>
       )}
 
@@ -325,15 +370,9 @@ export default function PlayScreen() {
       <FlatList
         data={filteredTracks}
         renderItem={renderTrack}
-        keyExtractor={item => item.id}
+        keyExtractor={(item: any) => item.id}
         contentContainerStyle={styles.listContent}
-        refreshControl={
-          <RefreshControl
-            refreshing={isRefreshing}
-            onRefresh={onRefresh}
-            tintColor="#3B82F6"
-          />
-        }
+        refreshControl={<RefreshControl refreshing={isRefreshing} onRefresh={onRefresh} tintColor="#3B82F6" />}
         ListEmptyComponent={
           <Text style={styles.emptyText}>
             {activeSegment === 'all'
