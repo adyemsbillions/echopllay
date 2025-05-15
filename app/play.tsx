@@ -31,11 +31,18 @@ async function fetchWebApi(endpoint: string) {
 }
 
 // Fetch tracks from Jamendo
-async function getOnlineTracks(offset = 0, limit = 100) {
+async function getOnlineTracks(offset = 0, limit = 100, searchQuery = '') {
   try {
     const clientId = 'a31365c7'; // Your Jamendo API client ID
-    const data = await fetchWebApi(`/tracks/?client_id=${clientId}&format=json&limit=${limit}&offset=${offset}&order=downloads_total`);
-    console.log('Jamendo tracks response:', { offset, count: data.results.length, audioFields: data.results.map(t => t.audio) });
+    const queryParam = searchQuery ? `&namesearch=${encodeURIComponent(searchQuery)}` : '';
+    const endpoint = `/tracks/?client_id=${clientId}&format=json&limit=${limit}&offset=${offset}&order=downloads_total${queryParam}`;
+    const data = await fetchWebApi(endpoint);
+    console.log('Jamendo tracks response:', {
+      offset,
+      searchQuery,
+      count: data.results.length,
+      audioFields: data.results.map(t => t.audio),
+    });
     return data.results;
   } catch (error) {
     throw error;
@@ -58,6 +65,8 @@ export default function PlayScreen() {
   const [pageOffset, setPageOffset] = useState(0);
   const [hasMoreTracks, setHasMoreTracks] = useState(true);
   const [errorMessage, setErrorMessage] = useState(null);
+  const [retryCount, setRetryCount] = useState(0);
+  const MAX_RETRIES = 3;
 
   const PLACEHOLDER_IMAGE = require('../assets/images/placeholder.jpg');
 
@@ -102,7 +111,7 @@ export default function PlayScreen() {
   }, []);
 
   // Fetch online tracks
-  const fetchTracks = async (isRetry = false, append = false) => {
+  const fetchTracks = async (isRetry = false, append = false, query = '') => {
     if (!isConnected) {
       setTracks([]);
       setFilteredTracks([]);
@@ -112,7 +121,7 @@ export default function PlayScreen() {
     setIsLoading(true);
     setErrorMessage(null);
     try {
-      let onlineTracks = await getOnlineTracks(pageOffset);
+      let onlineTracks = await getOnlineTracks(pageOffset, 100, query);
       let validTracks = onlineTracks
         .filter((track: any) => track && track.audio && isValidUrl(track.audio))
         .map((track: any) => ({
@@ -131,11 +140,15 @@ export default function PlayScreen() {
 
       console.log(`Fetched ${onlineTracks.length} tracks, ${validTracks.length} valid after filtering`);
 
-      if (validTracks.length === 0 && tracks.length === 0) {
-        setErrorMessage('No tracks with valid URLs found. Retrying with next page...');
+      if (validTracks.length === 0 && retryCount < MAX_RETRIES) {
+        setErrorMessage(`No valid tracks found${query ? ' for search' : ''}. Retrying with next page...`);
         setPageOffset(prev => prev + 100);
-        setTimeout(() => fetchTracks(isRetry, append), 2000);
+        setRetryCount(prev => prev + 1);
+        setTimeout(() => fetchTracks(isRetry, append, query), 2000);
         return;
+      } else if (validTracks.length === 0) {
+        setErrorMessage(`No valid tracks found${query ? ' for search' : ''} after retries. Try a different search or refresh.`);
+        setHasMoreTracks(false);
       } else if (validTracks.length < onlineTracks.length) {
         setErrorMessage(`${onlineTracks.length - validTracks.length} tracks lack valid URLs and are excluded.`);
       }
@@ -143,15 +156,17 @@ export default function PlayScreen() {
       setTracks(prev => (append ? [...prev, ...validTracks] : validTracks));
       setFilteredTracks(prev => (append ? [...prev, ...validTracks] : validTracks));
       setHasMoreTracks(validTracks.length === 100);
+      setRetryCount(0); // Reset retry count on success
     } catch (error) {
-      console.error('Error fetching online tracks:', error);
+      console.error('Error fetching tracks:', error);
       const errorMsg =
         error.message === 'HTTP error! status: 401'
           ? 'Invalid Jamendo client ID. Please verify your client ID at https://developer.jamendo.com/.'
-          : 'Failed to load online tracks. Please check your network or try again later.';
+          : `Failed to load tracks${query ? ' for search' : ''}. Please check your network or try again later.`;
       setErrorMessage(errorMsg);
-      if (!isRetry) {
-        setTimeout(() => fetchTracks(true, append), 2000);
+      if (!isRetry && retryCount < MAX_RETRIES) {
+        setRetryCount(prev => prev + 1);
+        setTimeout(() => fetchTracks(true, append, query), 2000);
       }
     } finally {
       setIsLoading(false);
@@ -192,8 +207,9 @@ export default function PlayScreen() {
     setIsRefreshing(true);
     setPageOffset(0);
     setHasMoreTracks(true);
+    setRetryCount(0);
     if (activeSegment === 'all') {
-      fetchTracks(false, false);
+      fetchTracks(false, false, searchQuery);
     } else {
       fetchLocalTracks();
       setIsRefreshing(false);
@@ -204,7 +220,7 @@ export default function PlayScreen() {
   const loadMoreTracks = () => {
     if (isLoading || !hasMoreTracks || activeSegment !== 'all') return;
     setPageOffset(prev => prev + 100);
-    fetchTracks(false, true);
+    fetchTracks(false, true, searchQuery);
   };
 
   // Initial data fetch
@@ -226,26 +242,41 @@ export default function PlayScreen() {
     setSearchQuery('');
   }, [activeSegment]);
 
-  // Filter tracks based on search query
+  // Handle search
   useEffect(() => {
-    const data = activeSegment === 'all' ? tracks : localTracks;
-    if (searchQuery.trim() === '') {
-      setFilteredTracks(data);
-      setErrorMessage(tracks.length > 0 ? null : errorMessage); // Preserve error if no tracks
-    } else {
-      const query = searchQuery.toLowerCase();
-      const filtered = data.filter(
-        (track: any) =>
-          track.name.toLowerCase().includes(query) || track.artist_name.toLowerCase().includes(query)
-      );
-      setFilteredTracks(filtered);
-      if (filtered.length === 0 && tracks.length > 0) {
-        setErrorMessage('No tracks match your search. Try a different query.');
+    if (activeSegment !== 'all') {
+      const data = localTracks;
+      if (searchQuery.trim() === '') {
+        setFilteredTracks(data);
+        setErrorMessage(localTracks.length > 0 ? null : errorMessage);
       } else {
-        setErrorMessage(null);
+        const query = searchQuery.toLowerCase();
+        const filtered = data.filter(
+          (track: any) =>
+            track.name.toLowerCase().includes(query) || track.artist_name.toLowerCase().includes(query)
+        );
+        setFilteredTracks(filtered);
+        if (filtered.length === 0 && localTracks.length > 0) {
+          setErrorMessage('No local tracks match your search. Try a different query.');
+        } else {
+          setErrorMessage(null);
+        }
       }
+      return;
     }
-  }, [searchQuery, tracks, localTracks, activeSegment]);
+
+    if (searchQuery.trim() === '') {
+      setPageOffset(0);
+      setHasMoreTracks(true);
+      setRetryCount(0);
+      fetchTracks(false, false, '');
+    } else {
+      setPageOffset(0);
+      setHasMoreTracks(true);
+      setRetryCount(0);
+      fetchTracks(false, false, searchQuery);
+    }
+  }, [searchQuery, activeSegment, localTracks]);
 
   // Toggle favorite status
   const toggleFavorite = (trackId: string) => {
@@ -381,13 +412,23 @@ export default function PlayScreen() {
         <TouchableOpacity
           onPress={() => {
             setErrorMessage(null);
-            if (errorMessage.includes('tracks lack valid URLs')) {
+            if (errorMessage.includes('tracks lack valid URLs') || errorMessage.includes('Failed to load tracks')) {
               setPageOffset(prev => prev + 100);
-              fetchTracks(false, true);
+              fetchTracks(false, true, searchQuery);
+            } else if (errorMessage.includes('No local tracks match')) {
+              setSearchQuery('');
             }
           }}
         >
-          <MaterialIcons name={errorMessage.includes('tracks lack valid URLs') ? 'refresh' : 'close'} size={20} color="#FFF" />
+          <MaterialIcons
+            name={
+              errorMessage.includes('tracks lack valid URLs') || errorMessage.includes('Failed to load tracks')
+                ? 'refresh'
+                : 'close'
+            }
+            size={20}
+            color="#FFF"
+          />
         </TouchableOpacity>
       </View>
     );
